@@ -3,7 +3,7 @@ import audioop
 import json
 import os
 import re
-import threading
+from contextlib import asynccontextmanager
 from threading import Event, Thread
 
 import numpy as np
@@ -23,19 +23,22 @@ CHUNK_TOKENS = 25
 OVERLAP_TOKENS = 2
 SAMPLES_PER_TOKEN = 320  # 24000 Hz / 75 tokens per second
 
-app = FastAPI()
 audio_tokenizer: AudioTokenizerV2 | None = None
 model: AutoModelForCausalLM | None = None
 model_lock = asyncio.Lock()
 
 
-@app.on_event("startup")
-async def load_model() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global audio_tokenizer, model
     audio_tokenizer = AudioTokenizerV2(MODEL_ID, WAV_MODEL, WAV_CONFIG)
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
     model = model.to(audio_tokenizer.device)
     print("[magana-tts] model loaded")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -93,6 +96,7 @@ async def _synthesize(
         audio_tokenizer.tokenizer,
         skip_prompt=True,
         skip_special_tokens=False,
+        timeout=30,
     )
 
     audio_queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue()
@@ -101,6 +105,7 @@ async def _synthesize(
         try:
             model.generate(
                 input_ids=input_ids,
+                do_sample=True,
                 temperature=0.1,
                 repetition_penalty=1.1,
                 max_length=4000,
