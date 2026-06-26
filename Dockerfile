@@ -1,10 +1,10 @@
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM --platform=linux/amd64 pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
 
-# Install system deps
+# Install system deps (build-essential needed for pesq C extension)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl \
+    git wget curl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps
