@@ -14,15 +14,11 @@ RUN pip install --no-cache-dir -r requirements-server.txt
 # Copy source
 COPY audiotokenizer.py .
 COPY server.py .
+COPY entrypoint.sh .
 COPY default_speakers/ ./default_speakers/
 COPY default_speakers_local/ ./default_speakers_local/
 
-# Download WavTokenizer artifacts at build time
-RUN mkdir -p /app/wav_models && \
-    wget -q -O /app/wavtokenizer.yaml \
-    "https://huggingface.co/novateur/WavTokenizer-medium-speech-75token/resolve/main/wavtokenizer_mediumdata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml" && \
-    pip install gdown && \
-    gdown 1-ASeEkrn4HY49yZWHTASgfGFNXdVnLTt -O /app/wavtokenizer.ckpt
+RUN chmod +x /app/entrypoint.sh
 
 ENV WAV_TOKENIZER_CONFIG=/app/wavtokenizer.yaml
 ENV WAV_TOKENIZER_MODEL=/app/wavtokenizer.ckpt
@@ -30,4 +26,4 @@ ENV MODEL_ID=saheedniyi/YarnGPT2
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+CMD ["/app/entrypoint.sh"]
