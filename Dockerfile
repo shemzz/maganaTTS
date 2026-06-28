@@ -15,13 +15,14 @@ RUN pip install --no-cache-dir -r requirements-server.txt
 COPY audiotokenizer.py .
 COPY server.py .
 COPY entrypoint.sh .
+COPY models/ ./models/
 COPY default_speakers/ ./default_speakers/
 COPY default_speakers_local/ ./default_speakers_local/
 
 RUN chmod +x /app/entrypoint.sh
 
-ENV WAV_TOKENIZER_CONFIG=/app/wavtokenizer.yaml
-ENV WAV_TOKENIZER_MODEL=/app/wavtokenizer.ckpt
+ENV WAV_TOKENIZER_CONFIG=/app/models/wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml
+ENV WAV_TOKENIZER_MODEL=/app/models/WavTokenizer_small_320_24k_4096.ckpt
 ENV MODEL_ID=saheedniyi/YarnGPT2
 
 EXPOSE 8000
