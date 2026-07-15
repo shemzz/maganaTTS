@@ -23,8 +23,8 @@ COPY default_speakers_local/ ./default_speakers_local/
 
 RUN chmod +x /app/entrypoint.sh && mkdir -p /app/models
 
-ENV WAV_TOKENIZER_CONFIG=/app/models/wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml
-ENV WAV_TOKENIZER_MODEL=/app/models/WavTokenizer_small_320_24k_4096.ckpt
+ENV WAV_TOKENIZER_CONFIG=/app/models/wavtokenizer_mediumdata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml
+ENV WAV_TOKENIZER_MODEL=/app/models/wavtokenizer_large_speech_320_24k.ckpt
 ENV MODEL_ID=saheedniyi/YarnGPT2
 
 EXPOSE 8000
