@@ -24,6 +24,11 @@ CHUNK_TOKENS = 75        # then 1s chunks: fewer decode calls and boundaries
 OVERLAP_TOKENS = 2
 SAMPLES_PER_TOKEN = 320  # 24000 Hz / 75 tokens per second
 TARGET_RMS = 0.125       # ~-18 dBFS; model output averages ~-24 dBFS
+LIMIT_KNEE = 0.85        # soft limiter threshold: transients above this get tanh-compressed
+
+# Sampling knobs for voice-quality experiments without code changes.
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.1"))
+REPETITION_PENALTY = float(os.environ.get("REPETITION_PENALTY", "1.1"))
 
 audio_tokenizer: AudioTokenizerV2 | None = None
 model: AutoModelForCausalLM | None = None
@@ -52,10 +57,22 @@ async def health() -> dict:
     return {"status": "ok", "model_loaded": model is not None}
 
 
+def _soft_limit(audio: torch.Tensor) -> torch.Tensor:
+    """Tanh-compress only the samples above LIMIT_KNEE so the utterance body can
+    be lifted to TARGET_RMS while transient peaks land smoothly under 1.0."""
+    magnitude = audio.abs()
+    over = magnitude > LIMIT_KNEE
+    if not bool(over.any()):
+        return audio
+    span = 1.0 - LIMIT_KNEE
+    compressed = LIMIT_KNEE + span * torch.tanh((magnitude - LIMIT_KNEE) / span)
+    return torch.where(over, torch.sign(audio) * compressed, audio)
+
+
 def _resample_and_encode(audio: torch.Tensor, output_format: str, gain: float = 1.0) -> bytes:
     """Resample 24kHz float32 tensor (1, N) to the target format and return bytes."""
     if gain != 1.0:
-        audio = torch.clamp(audio * gain, -1.0, 1.0)
+        audio = _soft_limit(audio * gain)
     if output_format == "ulaw_8000":
         resampled = torchaudio.functional.resample(audio, 24000, 8000)
         pcm16 = (resampled.squeeze().cpu().numpy() * 32767).astype(np.int16)
@@ -85,15 +102,15 @@ def _decode_chunk(
 
 
 def _utterance_gain(audio: torch.Tensor) -> float:
-    """Gain that brings the utterance toward TARGET_RMS without clipping.
-    Estimated once from the first chunk and held for the whole utterance so
-    loudness stays stable (later peaks are clamped in _resample_and_encode)."""
+    """Gain that brings the utterance toward TARGET_RMS. Estimated once from the
+    first chunk and held for the whole utterance so loudness stays stable.
+    No peak term: this model has near-full-scale transients over a ~-25 dBFS
+    body, so peak-capped linear gain stays ~1.0 and the audio remains too
+    quiet — the soft limiter in _resample_and_encode absorbs the peaks."""
     rms = float(audio.pow(2).mean().sqrt())
     if rms < 1e-4:
         return 1.0
-    peak = float(audio.abs().max())
-    peak_safe = 0.985 / peak if peak > 0 else 8.0
-    return max(1.0, min(TARGET_RMS / rms, peak_safe, 8.0))
+    return max(1.0, min(TARGET_RMS / rms, 8.0))
 
 
 async def _synthesize(
@@ -125,8 +142,8 @@ async def _synthesize(
             model.generate(
                 input_ids=input_ids,
                 do_sample=True,
-                temperature=0.1,
-                repetition_penalty=1.1,
+                temperature=TEMPERATURE,
+                repetition_penalty=REPETITION_PENALTY,
                 max_length=4000,
                 streamer=streamer,
             )
