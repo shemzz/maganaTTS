@@ -54,7 +54,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "version": os.environ.get("GIT_SHA", "unknown"),
+    }
 
 
 def _soft_limit(audio: torch.Tensor) -> torch.Tensor:

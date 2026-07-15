@@ -27,6 +27,9 @@ ENV WAV_TOKENIZER_CONFIG=/app/models/wavtokenizer_mediumdata_frame75_3s_nq1_code
 ENV WAV_TOKENIZER_MODEL=/app/models/wavtokenizer_large_speech_320_24k.ckpt
 ENV MODEL_ID=saheedniyi/YarnGPT2
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 EXPOSE 8000
 
 CMD ["/app/entrypoint.sh"]
