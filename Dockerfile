@@ -1,6 +1,8 @@
-FROM --platform=linux/amd64 pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM --platform=linux/amd64 pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
 
 # Install system deps (build-essential needed for pesq C extension)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python deps
 COPY requirements-server.txt .
-RUN pip install --no-cache-dir -r requirements-server.txt
+RUN grep -vE "^(torch|torchaudio)(\[.*\])?(==.*)?$" requirements-server.txt > requirements-server-docker.txt \
+    && pip install --no-cache-dir -r requirements-server-docker.txt
 
 # Copy source
 COPY audiotokenizer.py .
