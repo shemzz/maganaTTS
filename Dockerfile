@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+FROM --platform=linux/amd64 pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
