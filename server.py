@@ -25,6 +25,8 @@ OVERLAP_TOKENS = 2
 SAMPLES_PER_TOKEN = 320  # 24000 Hz / 75 tokens per second
 TARGET_RMS = 0.125       # ~-18 dBFS; model output averages ~-24 dBFS
 LIMIT_KNEE = 0.85        # soft limiter threshold: transients above this get tanh-compressed
+GAIN_FLOOR_RMS = 0.01    # ~-40 dBFS: chunks below this are lead-in silence/breath; do not
+                         # estimate utterance gain from them or it locks at 1.0 (too quiet)
 
 # Sampling knobs for voice-quality experiments without code changes.
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.1"))
@@ -54,7 +56,12 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "model_loaded": model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": model is not None,
+        "version": os.environ.get("GIT_SHA", "unknown"),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
 
 
 def _soft_limit(audio: torch.Tensor) -> torch.Tensor:
@@ -101,15 +108,16 @@ def _decode_chunk(
     return audio
 
 
-def _utterance_gain(audio: torch.Tensor) -> float:
-    """Gain that brings the utterance toward TARGET_RMS. Estimated once from the
-    first chunk and held for the whole utterance so loudness stays stable.
+def _utterance_gain(audio: torch.Tensor) -> float | None:
+    """Gain that brings the utterance toward TARGET_RMS, or None if this chunk
+    is lead-in silence and gain should be estimated from a later, energetic
+    chunk. Locked once per utterance so loudness stays stable.
     No peak term: this model has near-full-scale transients over a ~-25 dBFS
     body, so peak-capped linear gain stays ~1.0 and the audio remains too
     quiet — the soft limiter in _resample_and_encode absorbs the peaks."""
     rms = float(audio.pow(2).mean().sqrt())
-    if rms < 1e-4:
-        return 1.0
+    if rms < GAIN_FLOOR_RMS:
+        return None
     return max(1.0, min(TARGET_RMS / rms, 8.0))
 
 
@@ -164,7 +172,7 @@ async def _synthesize(
                 gain = _utterance_gain(audio)
             prev_overlap = codes[-OVERLAP_TOKENS:]
             is_first = False
-            pcm = _resample_and_encode(audio, output_format, gain)
+            pcm = _resample_and_encode(audio, output_format, gain if gain is not None else 1.0)
             loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
 
         for token_text in streamer:
