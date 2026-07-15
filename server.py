@@ -108,17 +108,20 @@ def _decode_chunk(
     return audio
 
 
-def _utterance_gain(audio: torch.Tensor) -> float | None:
-    """Gain that brings the utterance toward TARGET_RMS, or None if this chunk
-    is lead-in silence and gain should be estimated from a later, energetic
-    chunk. Locked once per utterance so loudness stays stable.
-    No peak term: this model has near-full-scale transients over a ~-25 dBFS
-    body, so peak-capped linear gain stays ~1.0 and the audio remains too
-    quiet — the soft limiter in _resample_and_encode absorbs the peaks."""
+def _agc_gain(prev: float | None, audio: torch.Tensor) -> float | None:
+    """Slow AGC: per-chunk gain toward TARGET_RMS, smoothed to avoid pumping.
+    A single utterance-level gain does not work for this model: measured
+    dynamics show the first chunk can sit at -17 dBFS while the rest of the
+    utterance trails off to -26..-33 dBFS, so a gain locked from the first
+    energetic chunk leaves the tail inaudible. Silent chunks hold the previous
+    gain. The soft limiter in _resample_and_encode absorbs transient peaks."""
     rms = float(audio.pow(2).mean().sqrt())
     if rms < GAIN_FLOOR_RMS:
-        return None
-    return max(1.0, min(TARGET_RMS / rms, 8.0))
+        return prev
+    target = max(1.0, min(TARGET_RMS / rms, 8.0))
+    if prev is None:
+        return target
+    return 0.6 * prev + 0.4 * target
 
 
 async def _synthesize(
@@ -168,36 +171,39 @@ async def _synthesize(
         def emit(codes: list[int]) -> None:
             nonlocal prev_overlap, is_first, gain
             audio = _decode_chunk(codes, prev_overlap, is_first)
-            if gain is None:
-                gain = _utterance_gain(audio)
+            gain = _agc_gain(gain, audio)
             prev_overlap = codes[-OVERLAP_TOKENS:]
             is_first = False
             pcm = _resample_and_encode(audio, output_format, gain if gain is not None else 1.0)
             loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
 
-        for token_text in streamer:
-            if clear_event.is_set():
-                break
-            text_buf += token_text
-            # Extract complete <|N|> patterns; keep tail that may be partial
-            matches = list(re.finditer(r"<\|(-?\d+)\|>", text_buf))
-            if matches:
-                last_end = matches[-1].end()
-                text_buf = text_buf[last_end:]
-                codes_buf.extend(int(m.group(1)) for m in matches)
+        # Any exception here (including the streamer's 30s timeout raising
+        # queue.Empty) MUST reach audio_queue: _synthesize awaits the queue
+        # while holding model_lock, so a silently dead collector deadlocks
+        # every subsequent synthesis on the pod.
+        try:
+            for token_text in streamer:
+                if clear_event.is_set():
+                    break
+                text_buf += token_text
+                # Extract complete <|N|> patterns; keep tail that may be partial
+                matches = list(re.finditer(r"<\|(-?\d+)\|>", text_buf))
+                if matches:
+                    last_end = matches[-1].end()
+                    text_buf = text_buf[last_end:]
+                    codes_buf.extend(int(m.group(1)) for m in matches)
 
-            # Small first chunk for fast first-audio, then larger chunks so the
-            # decoder is called less often (throughput) with fewer boundaries.
-            target = FIRST_CHUNK_TOKENS if is_first else CHUNK_TOKENS
-            while len(codes_buf) >= target and not clear_event.is_set():
-                chunk = codes_buf[:target]
-                codes_buf = codes_buf[target:]
-                try:
+                # Small first chunk for fast first-audio, then larger chunks so the
+                # decoder is called less often (throughput) with fewer boundaries.
+                target = FIRST_CHUNK_TOKENS if is_first else CHUNK_TOKENS
+                while len(codes_buf) >= target and not clear_event.is_set():
+                    chunk = codes_buf[:target]
+                    codes_buf = codes_buf[target:]
                     emit(chunk)
-                except Exception as exc:
-                    loop.call_soon_threadsafe(audio_queue.put_nowait, exc)
-                    return
-                target = CHUNK_TOKENS
+                    target = CHUNK_TOKENS
+        except Exception as exc:
+            loop.call_soon_threadsafe(audio_queue.put_nowait, exc)
+            return
 
         # Flush remaining codes
         if codes_buf and not clear_event.is_set():
@@ -215,7 +221,10 @@ async def _synthesize(
     collect_thread.start()
 
     while True:
-        item = await audio_queue.get()
+        # Belt-and-braces: the streamer's own 30s timeout should surface any
+        # stall as an Exception item, but if both worker threads die without
+        # posting one, this must not hold model_lock forever.
+        item = await asyncio.wait_for(audio_queue.get(), timeout=90)
         if item is None:
             break
         if isinstance(item, Exception):
