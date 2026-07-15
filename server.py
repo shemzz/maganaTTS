@@ -19,9 +19,11 @@ MODEL_ID = os.environ.get("MODEL_ID", "saheedniyi/YarnGPT2")
 WAV_CONFIG = os.environ.get("WAV_TOKENIZER_CONFIG", "/app/wavtokenizer.yaml")
 WAV_MODEL = os.environ.get("WAV_TOKENIZER_MODEL", "/app/wavtokenizer.ckpt")
 
-CHUNK_TOKENS = 25
+FIRST_CHUNK_TOKENS = 25  # small first chunk keeps time-to-first-audio low
+CHUNK_TOKENS = 75        # then 1s chunks: fewer decode calls and boundaries
 OVERLAP_TOKENS = 2
 SAMPLES_PER_TOKEN = 320  # 24000 Hz / 75 tokens per second
+TARGET_RMS = 0.125       # ~-18 dBFS; model output averages ~-24 dBFS
 
 audio_tokenizer: AudioTokenizerV2 | None = None
 model: AutoModelForCausalLM | None = None
@@ -32,7 +34,11 @@ model_lock = asyncio.Lock()
 async def lifespan(app: FastAPI):
     global audio_tokenizer, model
     audio_tokenizer = AudioTokenizerV2(MODEL_ID, WAV_MODEL, WAV_CONFIG)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
+    # bf16 roughly doubles-to-quadruples token throughput vs the fp32 the
+    # checkpoint loads as under "auto"; realtime factor was 1.13x in fp32,
+    # which is what made playback choppy (underruns).
+    dtype = torch.bfloat16 if torch.cuda.is_available() else "auto"
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=dtype)
     model = model.to(audio_tokenizer.device)
     print("[magana-tts] model loaded")
     yield
@@ -46,8 +52,10 @@ async def health() -> dict:
     return {"status": "ok", "model_loaded": model is not None}
 
 
-def _resample_and_encode(audio: torch.Tensor, output_format: str) -> bytes:
+def _resample_and_encode(audio: torch.Tensor, output_format: str, gain: float = 1.0) -> bytes:
     """Resample 24kHz float32 tensor (1, N) to the target format and return bytes."""
+    if gain != 1.0:
+        audio = torch.clamp(audio * gain, -1.0, 1.0)
     if output_format == "ulaw_8000":
         resampled = torchaudio.functional.resample(audio, 24000, 8000)
         pcm16 = (resampled.squeeze().cpu().numpy() * 32767).astype(np.int16)
@@ -62,19 +70,30 @@ def _decode_chunk(
     codes: list[int],
     prev_overlap: list[int],
     is_first: bool,
-    output_format: str,
-) -> bytes:
+) -> torch.Tensor:
     """
-    Decode a batch of audio codes to PCM bytes.
+    Decode a batch of audio codes to a 24kHz float32 tensor (1, num_samples).
     Prepends prev_overlap to smooth boundary artifacts, then trims those
-    samples before encoding so the caller receives only the intended chunk.
+    samples so the caller receives only the intended chunk.
     """
     full_codes = prev_overlap + codes
     audio = audio_tokenizer.get_audio(full_codes)  # (1, num_samples) at 24kHz
     if not is_first and prev_overlap:
         trim = len(prev_overlap) * SAMPLES_PER_TOKEN
         audio = audio[:, trim:]
-    return _resample_and_encode(audio, output_format)
+    return audio
+
+
+def _utterance_gain(audio: torch.Tensor) -> float:
+    """Gain that brings the utterance toward TARGET_RMS without clipping.
+    Estimated once from the first chunk and held for the whole utterance so
+    loudness stays stable (later peaks are clamped in _resample_and_encode)."""
+    rms = float(audio.pow(2).mean().sqrt())
+    if rms < 1e-4:
+        return 1.0
+    peak = float(audio.abs().max())
+    peak_safe = 0.985 / peak if peak > 0 else 8.0
+    return max(1.0, min(TARGET_RMS / rms, peak_safe, 8.0))
 
 
 async def _synthesize(
@@ -119,6 +138,17 @@ async def _synthesize(
         codes_buf: list[int] = []
         prev_overlap: list[int] = []
         is_first = True
+        gain: float | None = None
+
+        def emit(codes: list[int]) -> None:
+            nonlocal prev_overlap, is_first, gain
+            audio = _decode_chunk(codes, prev_overlap, is_first)
+            if gain is None:
+                gain = _utterance_gain(audio)
+            prev_overlap = codes[-OVERLAP_TOKENS:]
+            is_first = False
+            pcm = _resample_and_encode(audio, output_format, gain)
+            loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
 
         for token_text in streamer:
             if clear_event.is_set():
@@ -131,23 +161,23 @@ async def _synthesize(
                 text_buf = text_buf[last_end:]
                 codes_buf.extend(int(m.group(1)) for m in matches)
 
-            while len(codes_buf) >= CHUNK_TOKENS and not clear_event.is_set():
-                chunk = codes_buf[:CHUNK_TOKENS]
-                codes_buf = codes_buf[CHUNK_TOKENS:]
+            # Small first chunk for fast first-audio, then larger chunks so the
+            # decoder is called less often (throughput) with fewer boundaries.
+            target = FIRST_CHUNK_TOKENS if is_first else CHUNK_TOKENS
+            while len(codes_buf) >= target and not clear_event.is_set():
+                chunk = codes_buf[:target]
+                codes_buf = codes_buf[target:]
                 try:
-                    pcm = _decode_chunk(chunk, prev_overlap, is_first, output_format)
-                    prev_overlap = chunk[-OVERLAP_TOKENS:]
-                    is_first = False
-                    loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
+                    emit(chunk)
                 except Exception as exc:
                     loop.call_soon_threadsafe(audio_queue.put_nowait, exc)
                     return
+                target = CHUNK_TOKENS
 
         # Flush remaining codes
         if codes_buf and not clear_event.is_set():
             try:
-                pcm = _decode_chunk(codes_buf, prev_overlap, is_first, output_format)
-                loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
+                emit(codes_buf)
             except Exception as exc:
                 loop.call_soon_threadsafe(audio_queue.put_nowait, exc)
                 return
